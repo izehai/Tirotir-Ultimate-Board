@@ -1,0 +1,18 @@
+{
+  "name": "tirotir-ultimate-board",
+  "version": "2.2.2",
+  "private": true,
+  "description": "Ultimate LAN board v2.2.0: ES5 frontend, live draw (segments + strokes), text+files, paste support.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "Tirotir.ir",
+  "license": "MIT",
+  "dependencies": {
+    "compression": "^1.7.4",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "multer": "^2.0.0",
+    "socket.io": "^4.7.5"
+  }
+}

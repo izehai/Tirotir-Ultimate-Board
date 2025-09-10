@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Tirotir Ultimate Board v2.2.0 — Teacher</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Ultimate Board v2.2.0 — Teacher</h1>
+        <div class="muted">Text + Drawing + Any file • Multi-room • LAN</div>
+      </div>
+      <div class="bar">
+        <input id="room" placeholder="Room (e.g., class1)" />
+        <input id="key" placeholder="ADMIN_KEY (optional)" />
+        <button id="btnConnect" class="primary">Connect</button>
+        <button id="btnCopyLink">Copy student link</button>
+        <span id="stamp" class="badge">—</span>
+      </div>
+    </header>
+
+    <div class="brand">AI Academy • <strong>tirotir.ir</strong></div>
+
+    <div class="tabs">
+      <button class="tab on" data-tab="text">Text</button>
+      <button class="tab" data-tab="draw">Draw</button>
+      <button class="tab" data-tab="files">Files</button>
+    </div>
+
+    <section id="tab-text">
+      <textarea id="pad" placeholder="Type here… students see it instantly."></textarea>
+      <div class="bar" style="margin-top:8px">
+        <button id="btnCopy">Copy all</button>
+        <button id="btnPaste">Paste</button>
+        <button id="btnExportTxt">Export .txt</button>
+      </div>
+    </section>
+
+    <section id="tab-draw" hidden>
+      <div class="toolbar">
+        Tool:
+        <select id="tool">
+          <option value="pen">Pen</option>
+          <option value="highlighter">Highlighter</option>
+          <option value="eraser">Eraser</option>
+          <option value="line">Line</option>
+          <option value="rect">Rectangle</option>
+        </select>
+        Size: <input id="penSize" type="range" min="1" max="30" value="3">
+        Color: <input id="penColor" type="color" value="#ffffff">
+        <button id="btnUndo">Undo</button>
+        <button id="btnRedo">Redo</button>
+        <button id="btnClear">Clear</button>
+        <button id="btnSavePNG">Save PNG</button>
+      </div>
+      <canvas id="board" style="width:100%; max-width:100%; height:auto; aspect-ratio: 12 / 7;"></canvas>
+    </section>
+
+    <section id="tab-files" hidden>
+      <div class="drop" id="drop">Drag & drop files here or use the button below (any file type).</div>
+      <div class="bar">
+        <input id="upl" type="file" multiple>
+        <button id="btnUpload" class="primary">Upload</button>
+      </div>
+      <div id="files" class="files"></div>
+    </section>
+  </div>
+
+<script>
+  (function(){
+    // Optional: disable Service Worker via ?nosw=1
+    try{
+      var usp=new URLSearchParams(location.search);
+      if(usp.get('nosw')==='1' && 'serviceWorker' in navigator){
+        navigator.serviceWorker.getRegistrations().then(function(rs){
+          for(var i=0;i<rs.length;i++){ rs[i].unregister(); }
+          localStorage.setItem('ub_nosw_done','1'); location.replace(location.pathname);
+        });
+      } else if(localStorage.getItem('ub_nosw_done')==='1'){ localStorage.removeItem('ub_nosw_done'); }
+    }catch(e){}
+
+    function $(s){ return document.querySelector(s); }
+    function $all(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); }
+    var tabs=$all('.tab');
+    var sections={'text':$('#tab-text'),'draw':$('#tab-draw'),'files':$('#tab-files')};
+    for (var i=0;i<tabs.length;i++){
+      (function(t){
+        t.onclick=function(){
+          for(var j=0;j<tabs.length;j++){ tabs[j].classList.remove('on'); }
+          t.classList.add('on');
+          for(var k in sections){ if (sections.hasOwnProperty(k)) sections[k].hidden=true; }
+          sections[t.getAttribute('data-tab')].hidden=false;
+        };
+      })(tabs[i]);
+    }
+
+    var room=localStorage.getItem('ub_room')||'main', key=localStorage.getItem('ub_key')||'';
+    $('#room').value=room; $('#key').value=key;
+
+    var socket=null, stamp=$('#stamp');
+    function connect(){
+      room=($('#room').value||'main').trim(); key=($('#key').value||'').trim();
+      localStorage.setItem('ub_room',room); localStorage.setItem('ub_key',key);
+      console.log('connecting teacher to room', room);
+      socket=io({ auth:{ room: room, role: 'teacher', key: key } });
+      socket.on('connect',function(){ stamp.textContent='Connected'; });
+      socket.on('disconnect',function(){ stamp.textContent='Disconnected'; });
+      socket.on('init', function(st){ pad.value=st.text||''; strokes=st.strokes||[]; redrawAll(); renderFiles(st.files||[]); try{ if(window.requestAnimationFrame) requestAnimationFrame(resizeCanvas); else resizeCanvas(); }catch(e){} });
+      socket.on('update_text', function(st){ pad.value=st.text||pad.value; });
+      socket.on('draw_event', function(s){ if(s && s.id && seenIds[s.id]) return; if(s && s.id) seenIds[s.id]=1; strokes.push(s); applyStroke(s); });
+      socket.on('draw_segment', function(seg){ try{ if(seg && seg.id){ if(seenIds[seg.id+'_seg']) return; seenIds[seg.id+'_seg']=1; } applyStroke(seg); }catch(e){} });
+      socket.on('clear_canvas', function(){ strokes=[]; redrawAll(); });
+      socket.on('undo', function(){ strokes.pop(); redrawAll(); });
+      socket.on('redo', function(s){ if(s){ strokes.push(s); applyStroke(s); } });
+      socket.emit('request_full');
+      try{ window.__fullTimer && clearInterval(window.__fullTimer); window.__fullTimer = setInterval(function(){ if(socket && socket.connected){ socket.emit('request_full'); } }, 15000); }catch(e){}
+    }
+    $('#btnConnect').onclick=connect;
+    $('#btnCopyLink').onclick=function(){
+      var url=location.protocol+'//'+location.host+'/?room='+encodeURIComponent(($('#room').value||'main').trim());
+      try{ navigator.clipboard.writeText(url).then(function(){ alert('Student link copied:\n'+url); }, function(){ alert(url); }); }catch(e){ alert(url); }
+    };
+
+    // Text
+    var pad=$('#pad'); var tmr=null,lastPush=0;
+    pad.addEventListener('input',function(){
+      clearTimeout(tmr);
+      tmr=setTimeout(function(){
+        var now=Date.now(); if(now-lastPush<120) return; lastPush=now;
+        if (socket) socket.emit('update_text', {text:pad.value}, function(res){ try{ console.log('update_text ack:', res); }catch(e){} });
+      },160);
+    });
+    $('#btnCopy').onclick=function(){ pad.select(); try{navigator.clipboard.writeText(pad.value);}catch(e){document.execCommand('copy');}};
+    $('#btnExportTxt').onclick=function(){
+      var blob=new Blob([pad.value],{type:'text/plain;charset=utf-8'});
+      var a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=room+'_whiteboard.txt'; a.click(); URL.revokeObjectURL(a.href);
+    };
+
+    // Paste text (global)
+    function appendPastedText(t){
+      if(!t) return;
+      if (document.activeElement!==pad){
+        if (pad.value && pad.value.slice(-1)!=='\n') pad.value+='\n';
+        pad.value += t;
+        if (socket) socket.emit('update_text', {text:pad.value}, function(res){ try{ console.log('update_text ack:', res); }catch(e){} });
+      }
+    }
+    document.addEventListener('paste', function(e){
+      try{
+        var t='';
+        if (e.clipboardData && e.clipboardData.getData) t=e.clipboardData.getData('text/plain');
+        else if (window.clipboardData && window.clipboardData.getData) t=window.clipboardData.getData('Text');
+        if (t && document.activeElement!==pad){ e.preventDefault(); appendPastedText(t); }
+      }catch(err){}
+    });
+    $('#btnPaste').onclick=function(){
+      try{
+        if (navigator.clipboard && navigator.clipboard.readText){
+          navigator.clipboard.readText().then(function(t){ appendPastedText(t); }, function(){});
+        } else { alert('Use Ctrl+V to paste.'); }
+      }catch(e){ alert('Use Ctrl+V to paste.'); }
+    };
+
+    // Drawing
+    var board=$('#board'), ctx=board.getContext('2d'); var toolSel=$('#tool'), sizeSel=$('#penSize'), colorSel=$('#penColor');
+    var strokes=[], drawing=false,start=null,last=null; var seenIds={};
+
+    function resizeCanvas(){
+      var rect=board.getBoundingClientRect();
+      var dpr=window.devicePixelRatio||1;
+      var needW=Math.max(1, Math.round(rect.width*dpr));
+      var needH=Math.max(1, Math.round(rect.height*dpr));
+      if(board.width!==needW || board.height!==needH){ board.width=needW; board.height=needH; }
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      redrawAll();
+    }
+    window.addEventListener('load', function(){ if (window.requestAnimationFrame) requestAnimationFrame(resizeCanvas); else resizeCanvas(); });
+    window.addEventListener('resize', resizeCanvas); resizeCanvas();
+
+    function clearCanvas(){
+      ctx.fillStyle='#111b2f'; ctx.fillRect(0,0,board.width,board.height);
+      // watermark
+      ctx.save(); ctx.globalAlpha=0.06; ctx.fillStyle='#ffffff'; ctx.textAlign='center';
+      try{ ctx.font='bold 42px Tahoma, Arial, sans-serif'; }catch(e){}
+      ctx.translate(board.width/2, board.height/2); ctx.rotate(-Math.PI/8);
+      ctx.fillText('AI Academy', 0, 0); ctx.fillText('tirotir.ir', 0, 50);
+      ctx.restore();
+    }
+    function applyStroke(s){
+      ctx.save();
+      if(s.tool==='eraser'){ ctx.globalCompositeOperation='destination-out'; ctx.strokeStyle='rgba(0,0,0,1)'; }
+      else if(s.tool==='highlighter'){ ctx.globalAlpha=s.opacity||0.3; ctx.strokeStyle=s.color||'#ffff00'; }
+      else { ctx.strokeStyle=s.color||'#fff'; }
+      ctx.lineWidth=s.size||3; ctx.lineCap='round';
+      if(s.shape==='line'&&s.from&&s.to){ ctx.beginPath(); ctx.moveTo(s.from.x,s.from.y); ctx.lineTo(s.to.x,s.to.y); ctx.stroke(); }
+      else if(s.shape==='rect'&&s.rect){ ctx.lineJoin='round'; ctx.strokeRect(s.rect.x,s.rect.y,s.rect.w,s.rect.h); }
+      else if(s.points&&s.points.length){ ctx.beginPath(); ctx.moveTo(s.points[0].x,s.points[0].y); for(var i=1;i<s.points.length;i++){ ctx.lineTo(s.points[i].x,s.points[i].y);} ctx.stroke(); }
+      ctx.restore();
+    }
+    function redrawAll(){ clearCanvas(); for(var i=0;i<strokes.length;i++) applyStroke(strokes[i]); }
+    function pos(e){
+      var r=board.getBoundingClientRect();
+      var clientX = (e.touches && e.touches[0]) ? e.touches[0].clientX : (e.clientX!=null?e.clientX:0);
+      var clientY = (e.touches && e.touches[0]) ? e.touches[0].clientY : (e.clientY!=null?e.clientY:0);
+      var x=clientX - r.left;
+      var y=clientY - r.top;
+      return {x: Math.max(0, Math.min(r.width, x)), y: Math.max(0, Math.min(r.height, y))};
+    }
+    function baseStroke(){
+      return {
+        id:(Date.now().toString(36)+Math.random().toString(36).slice(2,6)),
+        tool: toolSel.value,
+        color: colorSel.value,
+        size: parseInt(sizeSel.value,10),
+        opacity: (toolSel.value==='highlighter'?0.3:1)
+      };
+    }
+
+    function beginStroke(e){
+      if(e.preventDefault) e.preventDefault();
+      drawing=true; if (board.setPointerCapture && e.pointerId!=null) board.setPointerCapture(e.pointerId);
+      start=pos(e); last=start;
+      if(toolSel.value==='line'||toolSel.value==='rect'){} else {
+        var st=baseStroke(); st.points=[last]; strokes.push(st); seenIds[st.id]=1;
+      }
+    }
+    function moveStroke(e){
+      if(!drawing) return;
+      var p=pos(e);
+      if(toolSel.value==='line'||toolSel.value==='rect'){
+        redrawAll();
+        var st=baseStroke();
+        if(toolSel.value==='line'){ st.shape='line'; st.from=start; st.to=p; }
+        else { st.shape='rect'; st.rect={x:Math.min(start.x,p.x), y:Math.min(start.y,p.y), w:Math.abs(p.x-start.x), h:Math.abs(p.y-start.y)}; }
+        applyStroke(st);
+      } else {
+        var cur=strokes[strokes.length-1];
+        if(cur&&cur.points){
+          cur.points.push(p);
+          var seg={ id:cur.id, tool:cur.tool, color:cur.color, size:cur.size, opacity:cur.opacity, points:[last,p] };
+          applyStroke(seg);
+          if(socket){
+            var now=Date.now(); if(!window.__lastEmit||now-window.__lastEmit>16){ window.__lastEmit=now; socket.emit('draw_segment', seg); }
+          }
+        }
+      }
+      last=p;
+    }
+    function endStroke(e){
+      if(!drawing) return;
+      if(e.preventDefault) e.preventDefault();
+      drawing=false; if (board.releasePointerCapture && e.pointerId!=null) board.releasePointerCapture(e.pointerId);
+      var end=last; var final=null;
+      if(toolSel.value==='line'){
+        var bs=baseStroke();
+        final={ id:bs.id, tool:bs.tool, color:bs.color, size:bs.size, opacity:bs.opacity, shape:'line', from:start, to:end };
+        strokes.push(final); seenIds[final.id]=1; redrawAll();
+      } else if(toolSel.value==='rect'){
+        var bs2=baseStroke();
+        final={ id:bs2.id, tool:bs2.tool, color:bs2.color, size:bs2.size, opacity:bs2.opacity, shape:'rect',
+                rect:{ x:Math.min(start.x,end.x), y:Math.min(start.y,end.y), w:Math.abs(end.x-start.x), h:Math.abs(end.y-start.y) } };
+        strokes.push(final); seenIds[final.id]=1; redrawAll();
+      } else {
+        final=strokes[strokes.length-1];
+      }
+      if(final && socket) socket.emit('draw_event', final);
+      start=null; last=null;
+    }
+
+    board.addEventListener('pointerdown', beginStroke, false);
+    board.addEventListener('pointermove', moveStroke, false);
+    board.addEventListener('pointerup',   endStroke, false);
+    board.addEventListener('pointercancel', endStroke, false);
+
+    board.addEventListener('mousedown', beginStroke, false);
+    board.addEventListener('mousemove', moveStroke, false);
+    window.addEventListener('mouseup', endStroke, false);
+    board.addEventListener('touchstart', beginStroke, {passive:false});
+    board.addEventListener('touchmove',  moveStroke,  {passive:false});
+    board.addEventListener('touchend',   endStroke,   {passive:false});
+
+    $('#btnUndo').onclick=function(){ if (socket) socket.emit('undo'); };
+    $('#btnRedo').onclick=function(){ if (socket) socket.emit('redo'); };
+    $('#btnClear').onclick=function(){ if (socket) socket.emit('clear_canvas'); };
+    $('#btnSavePNG').onclick=function(){
+      var dataURL=board.toDataURL('image/png');
+      fetch('/api/save-canvas?room='+encodeURIComponent(room)+'&key='+encodeURIComponent(key),
+        {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ dataURL: dataURL })}
+      ).then(function(r){return r.json();}).then(function(j){ alert(j.ok?('Saved: '+j.url):('Error: '+j.error)); }).catch(function(e){ alert('Error: '+e.message); });
+    };
+
+    // Files
+    var filesDiv=$('#files'), upl=$('#upl'), drop=$('#drop');
+    function renderFiles(list){
+      if(!list || !list.length){ filesDiv.innerHTML='<div class="muted">No files yet.</div>'; return; }
+      var html=''; for (var i=0;i<list.length;i++){ var f=list[i]; var kb=Math.round((f.size||0)/1024); html+='<div><a href="'+f.url+'" target="_blank">'+f.name+'</a> <span class="muted">('+kb+' KB)</span></div>'; }
+      filesDiv.innerHTML=html;
+    }
+    function doUpload(fileList){
+      if(!fileList || !fileList.length){ alert('No file selected'); return; }
+      var fd=new FormData(); for (var i=0;i<fileList.length;i++){ fd.append('files',fileList[i]); }
+      fetch('/api/upload?room='+encodeURIComponent(room)+'&key='+encodeURIComponent(key),{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(j){ if(!j.ok){ alert('Upload error: '+(j.error||'')); } else { upl.value=''; } }).catch(function(e){ alert('Upload error: '+e.message); });
+    }
+    $('#btnUpload').onclick=function(){ doUpload(upl.files); };
+    drop.addEventListener('dragover',function(e){ e.preventDefault(); drop.classList.add('hover'); });
+    drop.addEventListener('dragleave',function(e){ e.preventDefault(); drop.classList.remove('hover'); });
+    drop.addEventListener('drop',function(e){ e.preventDefault(); drop.classList.remove('hover'); doUpload(e.dataTransfer.files); });
+
+    // Global error log
+    window.addEventListener('error',function(e){ console.log('Teacher JS error:', e.message, 'at', e.filename+':'+e.lineno); });
+    clearCanvas();
+  })();
+</script>
+</body>
+</html>
